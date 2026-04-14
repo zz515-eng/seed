@@ -6,4 +6,4 @@ __pycache__/
 *.pyc
 
 # Ignore large model weights (GitHub 100MB limit)
-*.pt
+
