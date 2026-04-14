@@ -10,7 +10,11 @@ This repository contains the core pipeline for Project Seed, including data prep
   - `dataset_loader.py`: Contains the `VirusRnaDataset` class to load CSV labels and H5 features.
 - `weights/`: Pre-trained model weights.
   - `best_seed_model.pt`: The fine-tuned weights for inference (Trained on the N=160 dataset).
-- `data/`: Sample data.
+  - `base_human_model.pt`: The original base foundation model trained on human data (pre-fine-tuning).
+- `data/`: Complete fine-tuning dataset splits (N=160).
+  - `train.csv`: Training set.
+  - `val.csv`: Validation set.
+  - `test.csv`: Test set.
   - `sample_train_ultimate.csv`: Example of the processed dataset format (N=160 samples).
 - `inference/`: Example scripts for model evaluation.
   - `example_inference.py`: Demonstrates how to load the model, apply correct regularization, and evaluate on a dataset.
