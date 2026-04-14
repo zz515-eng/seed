@@ -19,13 +19,18 @@ This repository contains the core pipeline for Project Seed, including data prep
 - `inference/`: Example scripts for model evaluation.
   - `example_inference.py`: Demonstrates how to load the model, apply correct regularization, and evaluate on a dataset.
 
-## 2. Data Preparation Pipeline
+## 2. Data Preparation for Custom Data
+
+If you want to use this model to evaluate your own viral RNA sequences, you must prepare your data in a specific format and extract the deep learning features.
 
 1. **Dataset Format**:
-   - Prepare your sequence data in a `.csv` format. 
-   - You can refer to `data/sample_train_ultimate.csv` for an example of the required columns (e.g., `context`, `label`, `rnastructure`).
+   - Prepare your sequence data in a `.csv` format. You can refer to `data/train.csv` for an example.
+   - Your `.csv` file MUST contain the following columns:
+     - `context`: The RNA/DNA sequence context around the candidate editing site. The sequence should be exactly **201 nucleotides** long, with the candidate mutation site at the center (position 101).
+     - `rnastructure`: The secondary structure of the `context` sequence in dot-bracket notation (length 201). **You must calculate this using a tool like [ViennaRNA RNAfold](https://www.tbi.univie.ac.at/RNA/RNAfold.1.html)** before passing the data to our pipeline.
+     - `label`: (Optional for inference) 1 for Edited, 0 for Non-edited.
 2. **Feature Extraction**:
-   - Use `data_prep/extract_virus_features.py` to convert the `.csv` sequences into a `.h5` feature matrix using the foundation model.
+   - Once your `.csv` is ready with `context` and `rnastructure`, use `data_prep/extract_virus_features.py` to convert the `.csv` sequences into a `.h5` feature matrix using the foundation model.
    - *Note: Due to file size limits, the large `.h5` feature matrices are not included in this repository and must be generated locally.*
 
 ## 3. How to Use the Model (Inference)
