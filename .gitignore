@@ -1,0 +1,9 @@
+# Ignore large files like H5 features
+*.h5
+
+# Ignore Python compiled files
+__pycache__/
+*.pyc
+
+# Ignore large model weights (GitHub 100MB limit)
+*.pt
