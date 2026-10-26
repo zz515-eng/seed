@@ -1,145 +1,110 @@
-import os
-import sys
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
+"""Load a CSV and its LucaVirus H5 for the FiLM model.
+
+Class 0 is the edited base. Class 1 is not edited. Dropout is not changed here.
+"""
+import numpy as np
 import pandas as pd
-from tqdm import tqdm
+import torch
+from torch.utils.data import Dataset
 
-sys.path.append('/zhouting')
-import model as model_module
-from train import RnaDataset
+SEQ_LEN = 201
+EDITED = {"A-to-G", "Edited"}
+NOT_EDITED = {"Non-edited"}
 
-class VirusRnaDataset(RnaDataset):
-    def __init__(self, csv_path, h5_path, *args, **kwargs):
-        super().__init__(csv_path, *args, **kwargs)
-        self.h5_path = h5_path
 
-def evaluate(model, dataloader, criterion, device):
-    model.eval()
-    total_loss = 0
-    all_preds, all_labels, all_probs = [], [], []
-    with torch.no_grad():
-        for batch in dataloader:
-            seq_embeddings = batch['seq_embeddings'].to(device)
-            trinuc_indices = batch['trinuc_indices'].to(device)
-            sec_struct_indices = batch['sec_struct_indices'].to(device)
-            shape_values = batch['shape_values'].to(device)
-            labels = batch['label'].to(device)
-
-            with torch.amp.autocast('cuda'):
-                logits = model(seq_embeddings, trinuc_indices, sec_struct_indices, shape_values)
-                loss = criterion(logits, labels)
-            total_loss += loss.item()
-            probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            preds = torch.argmax(logits, dim=1).cpu().numpy()
-            all_probs.extend(probs)
-            all_preds.extend(preds)
-            all_labels.extend(labels.cpu().numpy())
-
-    avg_loss = total_loss / len(dataloader)
-    metrics = {
-        'loss': avg_loss,
-        'accuracy': accuracy_score(all_labels, all_preds),
-        'f1_macro': f1_score(all_labels, all_preds, average='macro', zero_division=0)
+def build_trinucleotide_map():
+    bases = ["A", "C", "G", "T"]
+    mapping = {
+        b1 + b2 + b3: i
+        for i, (b1, b2, b3) in enumerate((x, y, z) for x in bases for y in bases for z in bases)
     }
-    try: metrics['roc_auc'] = roc_auc_score(all_labels, all_probs)
-    except: metrics['roc_auc'] = 0.5
-    return metrics
+    for b1 in bases + ["N"]:
+        for b2 in bases + ["N"]:
+            for b3 in bases + ["N"]:
+                token = b1 + b2 + b3
+                if token not in mapping:
+                    mapping[token] = 0
+    return mapping
 
-def run_finetune():
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    output_dir = "/zhouting/experiment_v3_regularization/results"
-    os.makedirs(output_dir, exist_ok=True)
 
-    # Load Data
-    train_dataset = VirusRnaDataset("/zhouting/virus splits/train.csv", "/zhouting/virus splits/train_features.h5", tokenizer=None, lucavirus_model=None, device=DEVICE, seq_len=201, positive_class="A-to-G")
-    val_dataset = VirusRnaDataset("/zhouting/virus splits/val.csv", "/zhouting/virus splits/val_features.h5", tokenizer=None, lucavirus_model=None, device=DEVICE, seq_len=201, positive_class="A-to-G")
-    
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
+TRINUC_MAP = build_trinucleotide_map()
 
-    # Initialize Model
-    model = model_module.RnaClassifier(embedding_dim=2560, trinuc_vocab_size=65, trinuc_embedding_dim=2560, sec_struct_vocab_size=3, sec_struct_emb_dim=2560, num_classes=2).to(DEVICE)
-    model.embedding_dim = 1024
-    
-    # ADD STRONGER DROPOUT for regularization
-    model.conformer.dropout = nn.Dropout(0.3) # Increased from 0.1
-    for layer in model.conformer.layers:
-        layer.ff1.dropout1 = nn.Dropout(0.3)
-        layer.ff1.dropout2 = nn.Dropout(0.3)
-        layer.ff2.dropout1 = nn.Dropout(0.3)
-        layer.ff2.dropout2 = nn.Dropout(0.3)
-        layer.attn.dropout = nn.Dropout(0.3)
-        layer.conv.dropout = nn.Dropout(0.3)
-    
-    model.classifier_head[2] = nn.Dropout(0.5) # Increased from 0.1
-    
-    model.load_state_dict(torch.load("/zhouting/training_results_full/conformer/ce/best_model.pt", map_location=DEVICE), strict=False)
 
-    print("\n🚀 Starting V3: DLR + Label Smoothing + High Weight Decay + High Dropout 🚀")
-    
-    # STRATEGY V3: DLR + Stronger Regularization
-    base_params, conformer_params, head_params = [], [], []
-    for name, param in model.named_parameters():
-        if "classifier_head" in name:
-            head_params.append(param)
-        elif "conformer" in name:
-            conformer_params.append(param)
-        else:
-            base_params.append(param)
+def sequence_window(sequence, center, window_size):
+    start = max(0, center - window_size // 2)
+    end = start + window_size
+    window = sequence[start:end]
+    if len(window) < window_size:
+        if start == 0 and center < window_size // 2:
+            window = "N" * (window_size // 2 - center) + window
+        if end >= len(sequence):
+            window = window + "N" * (window_size - len(window))
+    return window[:window_size].ljust(window_size, "N")
 
-    # Increased weight decay significantly (from 1e-3 to 1e-2) to penalize large weights
-    optimizer = optim.AdamW([
-        {'params': base_params, 'lr': 1e-6},
-        {'params': conformer_params, 'lr': 5e-5},
-        {'params': head_params, 'lr': 5e-4}
-    ], weight_decay=1e-2) 
 
-    # Implement Label Smoothing (0.1 means target becomes 0.9 and 0.1 instead of 1.0 and 0.0)
-    # This prevents the model from becoming overconfident on the small training set
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-7)
-    scaler = torch.amp.GradScaler('cuda')
+def trinuc_indices(window):
+    dna = window.upper().replace("U", "T")
+    padded = "N" + dna + "N"
+    return [TRINUC_MAP.get(padded[i : i + 3], 0) for i in range(len(window))]
 
-    best_val_acc = 0.0
-    history = []
 
-    for epoch in range(1, 21):
-        model.train()
-        train_loss = 0
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch}"):
-            optimizer.zero_grad()
-            with torch.amp.autocast('cuda'):
-                logits = model(batch['seq_embeddings'].to(DEVICE), batch['trinuc_indices'].to(DEVICE), batch['sec_struct_indices'].to(DEVICE), batch['shape_values'].to(DEVICE))
-                loss = criterion(logits, batch['label'].to(DEVICE))
-            scaler.scale(loss).backward()
-            
-            # Gradient clipping to prevent exploding gradients
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            scaler.step(optimizer)
-            scaler.update()
-            train_loss += loss.item()
-            
-        scheduler.step()
-            
-        val_metrics = evaluate(model, val_loader, criterion, DEVICE)
-        print(f"Epoch {epoch} | Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.4f} | Val AUC: {val_metrics['roc_auc']:.4f}")
-        
-        history.append({'epoch': epoch, 'val_loss': val_metrics['loss'], 'val_acc': val_metrics['accuracy']})
-        
-        # Save based on Accuracy instead of Loss because Label Smoothing changes the loss scale
-        if val_metrics['accuracy'] > best_val_acc:
-            best_val_acc = val_metrics['accuracy']
-            torch.save(model.state_dict(), os.path.join(output_dir, 'best_v3_model.pt'))
+def structure_indices(window):
+    mapping = {".": 0, "(": 1, ")": 2}
+    return [mapping.get(char, 0) for char in window]
 
-    pd.DataFrame(history).to_csv(os.path.join(output_dir, 'history.csv'), index=False)
-    print(f"Done! Saved to {output_dir}")
 
-if __name__ == "__main__":
-    run_finetune()
+def class_id(edit_type):
+    name = str(edit_type)
+    if name in EDITED:
+        return 0
+    if name in NOT_EDITED:
+        return 1
+    raise ValueError(f"Unexpected edit_type {name!r}. Use A-to-G or Non-edited.")
+
+
+class VirusRnaDataset(Dataset):
+    """Rows stay aligned with the H5. Missing fields are not dropped."""
+
+    def __init__(self, csv_path, h5_path, tokenizer=None, lucavirus_model=None, device=None, seq_len=SEQ_LEN, positive_class="A-to-G"):
+        del tokenizer, lucavirus_model, device
+        if positive_class not in EDITED:
+            raise ValueError(f"positive_class must be an edited label, got {positive_class!r}")
+        if seq_len != SEQ_LEN:
+            raise ValueError(f"This model uses a window of {SEQ_LEN}, got {seq_len}")
+
+        frame = pd.read_csv(csv_path)
+        required = ["context", "rnastructure", "edit_type"]
+        missing = [name for name in required if name not in frame.columns]
+        if missing:
+            raise ValueError(f"CSV is missing columns: {missing}")
+        if frame[required].isna().any().any():
+            raise ValueError("CSV rows are missing context, structure, or edit_type. Dropping them would break H5 alignment.")
+
+        self.contexts = frame["context"].astype(str).tolist()
+        self.structures = frame["rnastructure"].astype(str).tolist()
+        self.labels = np.array([class_id(value) for value in frame["edit_type"]], dtype=np.int64)
+        self.seq_len = seq_len
+
+        import h5py
+
+        self._handle = h5py.File(h5_path, "r")
+        self.features = self._handle["features"]
+        if tuple(self.features.shape[1:]) != (SEQ_LEN, 2560) or int(self.features.shape[0]) != len(frame):
+            raise ValueError(f"H5 shape {self.features.shape} does not match {len(frame)} CSV rows of length {SEQ_LEN}.")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        context = self.contexts[index]
+        structure = self.structures[index]
+        center = len(context) // 2
+        seq = sequence_window(context, center, self.seq_len)
+        dots = sequence_window(structure, center, self.seq_len)
+        embedding = torch.from_numpy(np.asarray(self.features[index], dtype=np.float16))
+        return {
+            "seq_embeddings": embedding,
+            "trinuc_indices": torch.tensor(trinuc_indices(seq), dtype=torch.long),
+            "sec_struct_indices": torch.tensor(structure_indices(dots), dtype=torch.long),
+            "label": torch.tensor(int(self.labels[index]), dtype=torch.long),
+        }
