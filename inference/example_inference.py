@@ -1,126 +1,169 @@
-import os
+"""Score a CSV with the FiLM model.
+
+Dropout stays 0.1. The readout is the center base. Do not raise dropout
+after loading. The weights currently in weights/ are the older concatenated
+model and will not load into this network.
+"""
+import argparse
 import sys
-import torch
-from torch.utils.data import DataLoader
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, matthews_corrcoef, roc_auc_score, roc_curve, confusion_matrix
-import matplotlib.pyplot as plt
-import seaborn as sns
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
+import torch
+from sklearn.metrics import accuracy_score, matthews_corrcoef, roc_auc_score
+from torch.utils.data import DataLoader, Dataset
 
-sys.path.append('/zhouting')
-import model as model_module
-from experiment_v3_regularization.finetune_v3 import VirusRnaDataset
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from model.model import RnaClassifier  # noqa: E402
 
-def evaluate_on_test():
-    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用设备: {DEVICE}")
+SEQ_LEN = 201
+# Class 0 is the edited base. Class 1 is not edited.
+EDITED = {"A-to-G", "Edited"}
+NOT_EDITED = {"Non-edited"}
 
-    # Load test dataset
-    print("Loading old test dataset (avoid50/N=248)...")
-    test_dataset = VirusRnaDataset("/zhouting/virus splits/test.csv", "/zhouting/virus splits/test_features.h5", tokenizer=None, lucavirus_model=None, device=DEVICE, seq_len=201, positive_class="A-to-G")
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 
-    # Load model
-    print("Loading the new model trained on sars2_ultimate (N=637)...")
-    model = model_module.RnaClassifier(embedding_dim=2560, trinuc_vocab_size=65, trinuc_embedding_dim=2560, sec_struct_vocab_size=3, sec_struct_emb_dim=2560, num_classes=2).to(DEVICE)
-    model.embedding_dim = 1024
-    
-    # Needs to match the Dropout architecture of V3
-    model.conformer.dropout = torch.nn.Dropout(0.3)
-    for layer in model.conformer.layers:
-        layer.ff1.dropout1 = torch.nn.Dropout(0.3)
-        layer.ff1.dropout2 = torch.nn.Dropout(0.3)
-        layer.ff2.dropout1 = torch.nn.Dropout(0.3)
-        layer.ff2.dropout2 = torch.nn.Dropout(0.3)
-        layer.attn.dropout = torch.nn.Dropout(0.3)
-        layer.conv.dropout = torch.nn.Dropout(0.3)
-    model.classifier_head[2] = torch.nn.Dropout(0.5)
+def build_trinucleotide_map():
+    bases = ["A", "C", "G", "T"]
+    mapping = {
+        b1 + b2 + b3: i
+        for i, (b1, b2, b3) in enumerate((x, y, z) for x in bases for y in bases for z in bases)
+    }
+    for b1 in bases + ["N"]:
+        for b2 in bases + ["N"]:
+            for b3 in bases + ["N"]:
+                token = b1 + b2 + b3
+                if token not in mapping:
+                    mapping[token] = 0
+    return mapping
 
-    output_dir = "/zhouting/viral_dataset_expansion/massive_run/new_model_on_old_data_results"
-    os.makedirs(output_dir, exist_ok=True)
-    model.load_state_dict(torch.load("/zhouting/viral_dataset_expansion/massive_run/v3_sars2_results/best_v3_sars2_model.pt", map_location=DEVICE))
+
+TRINUC_MAP = build_trinucleotide_map()
+
+
+def sequence_window(sequence, center, window_size):
+    start = max(0, center - window_size // 2)
+    end = start + window_size
+    window = sequence[start:end]
+    if len(window) < window_size:
+        if start == 0 and center < window_size // 2:
+            window = "N" * (window_size // 2 - center) + window
+        if end >= len(sequence):
+            window = window + "N" * (window_size - len(window))
+    return window[:window_size].ljust(window_size, "N")
+
+
+def trinuc_indices(window):
+    dna = window.upper().replace("U", "T")
+    padded = "N" + dna + "N"
+    return [TRINUC_MAP.get(padded[i : i + 3], 0) for i in range(len(window))]
+
+
+def structure_indices(window):
+    mapping = {".": 0, "(": 1, ")": 2}
+    return [mapping.get(char, 0) for char in window]
+
+
+def class_id(edit_type):
+    name = str(edit_type)
+    if name in EDITED:
+        return 0
+    if name in NOT_EDITED:
+        return 1
+    raise ValueError(f"Unexpected edit_type {name!r}. Use A-to-G or Non-edited.")
+
+
+class CsvH5Dataset(Dataset):
+    def __init__(self, csv_path, h5_path):
+        frame = pd.read_csv(csv_path)
+        required = ["context", "rnastructure", "edit_type"]
+        before = len(frame)
+        frame = frame.dropna(subset=required).reset_index(drop=True)
+        if len(frame) != before:
+            raise ValueError("CSV rows are missing context, structure, or edit_type. Dropping them would break H5 alignment.")
+        self.contexts = frame["context"].astype(str).tolist()
+        self.structures = frame["rnastructure"].astype(str).tolist()
+        self.labels = np.array([class_id(v) for v in frame["edit_type"]], dtype=np.int64)
+        import h5py
+
+        handle = h5py.File(h5_path, "r")
+        self.features = handle["features"]
+        self._handle = handle
+        if tuple(self.features.shape[1:]) != (SEQ_LEN, 2560) or int(self.features.shape[0]) != len(frame):
+            raise ValueError(f"H5 shape {self.features.shape} does not match {len(frame)} CSV rows of length {SEQ_LEN}.")
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        context = self.contexts[index]
+        structure = self.structures[index]
+        center = len(context) // 2
+        seq = sequence_window(context, center, SEQ_LEN)
+        dots = sequence_window(structure, center, SEQ_LEN)
+        embedding = torch.from_numpy(np.asarray(self.features[index], dtype=np.float16))
+        return {
+            "seq_embeddings": embedding,
+            "trinuc_indices": torch.tensor(trinuc_indices(seq), dtype=torch.long),
+            "sec_struct_indices": torch.tensor(structure_indices(dots), dtype=torch.long),
+            "label": torch.tensor(int(self.labels[index]), dtype=torch.long),
+        }
+
+
+def load_weights(path, device):
+    state = torch.load(path, map_location=device)
+    if isinstance(state, dict) and "state_dict" in state:
+        state = state["state_dict"]
+    if not isinstance(state, dict):
+        raise SystemExit(f"{path} is not a state dict.")
+    old = any(key.startswith("feature_projection") for key in state)
+    film = any(key.startswith("film_gen") for key in state)
+    if old and not film:
+        raise SystemExit(
+            f"{path} is the older concatenated model. "
+            "This script loads the FiLM model and reads the center base. "
+            "The matching weights are not in this repository yet."
+        )
+    return state
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--csv", type=Path, default=ROOT / "data" / "test.csv")
+    parser.add_argument("--h5", type=Path, required=True)
+    parser.add_argument("--weights", type=Path, default=ROOT / "weights" / "best_seed_model.pt")
+    parser.add_argument("--batch-size", type=int, default=32)
+    args = parser.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = RnaClassifier(pooling_strategy="center", dropout=0.1, attention_dropout=0.1).to(device)
+    model.load_state_dict(load_weights(args.weights, device))
     model.eval()
 
-    all_preds, all_labels, all_probs = [], [], []
-
-    print("Running evaluation on the independent test set...")
+    loader = DataLoader(CsvH5Dataset(args.csv, args.h5), batch_size=args.batch_size, shuffle=False)
+    labels, edited_prob, predictions = [], [], []
     with torch.no_grad():
-        for batch in test_loader:
-            seq_embeddings = batch['seq_embeddings'].to(DEVICE)
-            trinuc_indices = batch['trinuc_indices'].to(DEVICE)
-            sec_struct_indices = batch['sec_struct_indices'].to(DEVICE)
-            shape_values = batch['shape_values'].to(DEVICE)
-            labels = batch['label'].to(DEVICE)
+        for batch in loader:
+            logits = model(
+                batch["seq_embeddings"].to(device),
+                batch["trinuc_indices"].to(device),
+                batch["sec_struct_indices"].to(device),
+            )
+            probability = torch.softmax(logits, dim=1)[:, 0]
+            edited_prob.extend(probability.cpu().numpy())
+            predictions.extend(torch.argmax(logits, dim=1).cpu().numpy())
+            labels.extend(batch["label"].numpy())
 
-            with torch.amp.autocast('cuda'):
-                logits = model(seq_embeddings, trinuc_indices, sec_struct_indices, shape_values)
-                
-            probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            preds = torch.argmax(logits, dim=1).cpu().numpy()
-            
-            all_probs.extend(probs)
-            all_preds.extend(preds)
-            all_labels.extend(labels.cpu().numpy())
+    labels = np.asarray(labels)
+    edited_prob = np.asarray(edited_prob)
+    predictions = np.asarray(predictions)
+    print(f"rows {len(labels)}")
+    print(f"accuracy {accuracy_score(labels, predictions):.4f}")
+    print(f"MCC {matthews_corrcoef(labels, predictions):.4f}")
+    # Score class 0, the edited class, against the numeric labels.
+    print(f"AUC {roc_auc_score(labels == 0, edited_prob):.4f}")
 
-    # Calculate metrics
-    cm = confusion_matrix(all_labels, all_preds)
-    tn, fp, fn, tp = cm.ravel()
-    
-    acc = accuracy_score(all_labels, all_preds)
-    auc = roc_auc_score(all_labels, all_probs)
-    precision = precision_score(all_labels, all_preds, zero_division=0)
-    recall = recall_score(all_labels, all_preds, zero_division=0)
-    f1 = f1_score(all_labels, all_preds, zero_division=0)
-    mcc = matthews_corrcoef(all_labels, all_preds)
-
-    print("\n" + "="*50)
-    print("🚀 FINAL TEST SET PERFORMANCE (V3 STRATEGY) 🚀")
-    print("="*50)
-    print(f"Total Test Samples: {len(all_labels)}")
-    print(f"Confusion Matrix: \n{cm}")
-    print(f"  - True Negatives (Correct Non-edited): {tn}")
-    print(f"  - False Positives (False Alarms): {fp}")
-    print(f"  - False Negatives (Missed Mutations): {fn}")
-    print(f"  - True Positives (Correct Mutations): {tp}")
-    print("-" * 50)
-    print(f"Overall Accuracy:  {acc:.4f}")
-    print(f"ROC-AUC Score:     {auc:.4f}")
-    print(f"MCC:               {mcc:.4f}")
-    print("-" * 50)
-    print(f"Metrics specifically for 'A-to-G' (Positive Class):")
-    print(f"Precision:         {precision:.4f}")
-    print(f"Recall:            {recall:.4f}")
-    print(f"F1-Score:          {f1:.4f}")
-    print("="*50)
-
-    # 1. Save Confusion Matrix Plot
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Greens', 
-                xticklabels=['Non-edited (0)', 'A-to-G (1)'], 
-                yticklabels=['Non-edited (0)', 'A-to-G (1)'],
-                annot_kws={"size": 16, "weight": "bold"})
-    plt.title(f'V3 Test Confusion Matrix\nAccuracy: {acc:.2%}', fontsize=16, pad=20)
-    plt.ylabel('True Label', fontsize=14)
-    plt.xlabel('Predicted Label', fontsize=14)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'v3_test_cm.png'), dpi=300)
-    plt.close()
-
-    # 2. Save ROC Curve
-    fpr, tpr, _ = roc_curve(all_labels, all_probs)
-    plt.figure(figsize=(8, 6))
-    plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {auc:.4f})')
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate', fontsize=14)
-    plt.ylabel('True Positive Rate', fontsize=14)
-    plt.title('V3 Strategy Test ROC Curve', fontsize=16)
-    plt.legend(loc="lower right", fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, 'v3_test_roc.png'), dpi=300)
-    plt.close()
 
 if __name__ == "__main__":
-    evaluate_on_test()
+    main()
