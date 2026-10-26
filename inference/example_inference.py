@@ -130,9 +130,9 @@ def load_weights(path, device):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", type=Path, default=ROOT / "data" / "test.csv")
+    parser.add_argument("--csv", type=Path, default=ROOT / "data" / "sites.csv")
     parser.add_argument("--h5", type=Path, required=True)
-    parser.add_argument("--weights", type=Path, default=ROOT / "weights" / "best_seed_model.pt")
+    parser.add_argument("--weights", type=Path, default=ROOT / "weights" / "base_human_model.pt")
     parser.add_argument("--batch-size", type=int, default=32)
     args = parser.parse_args()
 

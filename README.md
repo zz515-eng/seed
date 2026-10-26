@@ -3,33 +3,29 @@
 This repository contains the core pipeline for Project Seed, including data preparation, model architecture, inference scripts, and pre-trained weights.
 
 ## 1. Directory Structure
-- `data_prep/`: Scripts for processing raw sequences and extracting features.
-  - `extract_virus_features.py`: Python script to extract hidden representations (`.h5`) using a pre-trained foundation model.
-- `model/`: Neural network architecture and dataset loader.
-  - `model.py`: Core model definition (`RnaClassifier`).
-  - `dataset_loader.py`: Contains the `VirusRnaDataset` class to load CSV labels and H5 features.
-- `weights/`: Weight files kept from the older concatenated model.
-  - `best_seed_model.pt`: Older fine-tuned weights (N=160). These do not load into `model.py`.
-  - `base_human_model.pt`: Older human checkpoint from before that fine-tune. It also does not load into `model.py`.
-- `data/`: Complete fine-tuning dataset splits (N=160).
-  - `train.csv`: Training set.
-  - `val.csv`: Validation set.
-  - `test.csv`: Test set.
-  - `sample_train_ultimate.csv`: Example of the processed dataset format (N=160 samples).
-- `inference/`: Example scripts for model evaluation.
-  - `example_inference.py`: Loads the FiLM model, reads the center base, and evaluates a dataset.
+
+Current model, October 2026. FiLM, center-base readout, dropout 0.1.
+
+- `model/model.py`: `RnaClassifier`.
+- `model/dataset_loader.py`: `VirusRnaDataset`. Reads a CSV and an H5 in the same row order. Class 0 is edited.
+- `weights/base_human_model.pt`: Human ALU pretraining checkpoint. This is the starting point for the virus runs.
+- `weights/finetune/`: Leave-one-virus fine-tunes on `data/sites.csv`. One file each for HCV, MV, NoVGII, and HHV8. `results.txt` is the score record for that run.
+- `data/sites.csv`: 2958 rows, six viruses, edited and not-edited counts matched. Columns include `context`, `rnastructure`, and `edit_type`.
+- `inference/example_inference.py`: Loads the FiLM model. Default weights are `weights/base_human_model.pt`. Default table is `data/sites.csv`.
+- `data_prep/extract_virus_features.py`: Builds the H5 from a CSV. The 2958-row feature file is about 3 GB and is not in this repository.
+- `archive/20260414_concat_n160/`: The April concatenated model and the N=160 avoid50 tables. Those weights do not load into `model.py`.
 
 ## 2. Data Preparation for Custom Data
 
 If you want to use this model to evaluate your own viral RNA sequences, you must prepare your data in a specific format and extract the deep learning features.
 
 1. **Dataset Format**:
-   - Prepare your sequence data in a `.csv` format. You can refer to `data/train.csv` for an example.
+   - Prepare your sequence data in a `.csv` format. You can refer to `data/sites.csv` for an example.
    - Your `.csv` file MUST contain the following columns:
      - `context`: The RNA/DNA sequence context around the candidate editing site. The sequence should be exactly **201 nucleotides** long, with the candidate mutation site at the center (position 101).
      - `rnastructure`: The secondary structure of the `context` sequence in dot-bracket notation (length 201). **You must calculate this using a tool like [ViennaRNA RNAfold](https://www.tbi.univie.ac.at/RNA/RNAfold.1.html)** before passing the data to our pipeline.
      - `edit_type`: `A-to-G` or `Edited` for an edited site, `Non-edited` otherwise. The network uses class 0 for edited and class 1 for not edited.
-     - `label`: Optional. In the bundled CSV this old column is 1 for edited and 0 for not edited. Do not pass that number to the network as the class id.
+     - `label`: Optional, and not present in `data/sites.csv`. The loader uses `edit_type`.
 2. **Feature Extraction**:
    - Once your `.csv` is ready with `context` and `rnastructure`, use `data_prep/extract_virus_features.py` to convert the `.csv` sequences into a `.h5` feature matrix using the foundation model.
    - *Note: Due to file size limits, the large `.h5` feature matrices are not included in this repository and must be generated locally.*
@@ -52,8 +48,8 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # 1. Load Dataset
 dataset = VirusRnaDataset(
-    csv_path="data/sample_train_ultimate.csv", 
-    h5_path="path/to/your/generated_features.h5", 
+    csv_path="data/sites.csv",
+    h5_path="path/to/your/generated_features.h5",
     tokenizer=None, lucavirus_model=None, device=DEVICE, seq_len=201, positive_class="A-to-G"
 )
 dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
@@ -65,12 +61,11 @@ model = RnaClassifier(
     dropout=0.1, attention_dropout=0.1, pooling_strategy="center",
 ).to(DEVICE)
 
-# 3. Load a FiLM checkpoint. The files in weights/ are the older concatenated model
-# and will not load here.
-model.load_state_dict(torch.load("path/to/film_center_weights.pt", map_location=DEVICE))
+# 3. Load the human starting checkpoint, or one file under weights/finetune/.
+model.load_state_dict(torch.load("weights/base_human_model.pt", map_location=DEVICE))
 model.eval()
 
-# 5. Inference Loop
+# 4. Inference Loop
 with torch.no_grad():
     for batch in dataloader:
         # Pass batch to model
