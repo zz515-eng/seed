@@ -1,5 +1,32 @@
 # Project Seed: Model Usage and Data Pipeline
 
+## 中文说明
+
+新的在仓库外面，旧的整份在 `archive/20260414_concat_n160/`。两套不要混用。旧权重装不进现在的 `model/model.py`。
+
+现在用的文件：
+
+- `model/model.py`：网络结构。FiLM，看窗口正中间那个碱基，Dropout 保持 0.1。编辑是第 0 类，没编辑是第 1 类。
+- `model/dataset_loader.py`：按表的行序读取 CSV 和特征。
+- `inference/example_inference.py`：推理示例。默认权重是人类预训练，默认表是 `data/sites.csv`。
+- `weights/base_human_model.pt`：人类 ALU 预训练权重。测试准确率 0.948。病毒微调从这份开始。
+- `weights/finetune/HCV.pt`、`MV.pt`、`NoVGII.pt`、`HHV8.pt`：丙肝、麻疹、诺如、HHV8 的留一微调权重。分数在 `weights/finetune/results.txt`。
+- `data/sites.csv`：这次的位点表，2958 条，六种病毒，编辑和没编辑数量相同。
+- `data_prep/extract_virus_features.py`：把序列做成特征。大约 3 GB 的特征文件没有放进仓库。
+
+4 月的旧文件：
+
+- `archive/20260414_concat_n160/weights/best_seed_model.pt`：当时的微调权重。
+- `archive/20260414_concat_n160/weights/base_human_model.pt`：当时的人类权重。
+- `archive/20260414_concat_n160/data/`：N=160 的 train、val、test。
+
+克隆时先安装 Git LFS，否则权重下不下来：
+
+```
+git lfs install
+git clone https://github.com/zz515-eng/seed.git
+```
+
 This repository contains the core pipeline for Project Seed, including data preparation, model architecture, inference scripts, and pre-trained weights.
 
 ## 1. Directory Structure
